@@ -1,0 +1,338 @@
+name: NanoKVM Image
+
+# Builds a complete, flashable NanoKVM SD-card image: the LicheeRV Nano Linux
+# system (U-Boot, kernel, rootfs) from sipeed/LicheeRV-Nano-Build plus the
+# NanoKVM application from this checkout, merged with the SDK's own
+# kvm/merge_nanokvm_app.sh, exactly as documented in the SDK README.
+#
+# Why this exists: the USB mass-storage gadget in the kernel that ships in the
+# official images (up to v1.4.3) truncates CD-ROM backing files at
+# 256*60*75 sectors (~2.2 GiB). Windows Server / Windows 11 ISOs are larger, so
+# in CD-ROM mode the Windows Boot Manager fails with 0xc000000d on
+# \EFI\Microsoft\Boot\BCD, and in mass-storage mode Setup cannot find its
+# media at all. The fix (PiKVM's CD/DVD emulation patch) landed in the kernel
+# via sipeed/LicheeRV-Nano-Build#102 but was never released as an image. The
+# application package built by package.yml cannot carry it because
+# CONFIG_USB_F_MASS_STORAGE=y is built into the kernel. Only a full image can.
+#
+# The produced image is uploaded as a workflow artifact. Nothing is published
+# anywhere else; flashing it is a manual step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Application version to stamp into /kvmapp/version, e.g. 2.5.1 (empty = latest numeric tag, else 0.0.<run>)
+        required: false
+        default: ''
+        type: string
+      sdk_repo:
+        description: LicheeRV Nano SDK repository (owner/name)
+        required: false
+        default: sipeed/LicheeRV-Nano-Build
+        type: string
+      sdk_ref:
+        description: SDK branch, tag or commit to build the system image from
+        required: false
+        default: NanoKVM
+        type: string
+      variant:
+        description: standard = same package set as official images; minimal = smaller rootfs, no Python/frp/tailscale
+        required: true
+        default: standard
+        type: choice
+        options:
+          - standard
+          - minimal
+      builder_image:
+        description: Prebuilt nanokvm-builder image used to cross-compile the application
+        required: false
+        default: ghcr.io/sipeed/nanokvm-builder:latest
+        type: string
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # /mnt is a separate, mostly empty disk on GitHub-hosted runners. The SDK
+  # build (Buildroot + kernel) needs tens of GB, more than the root disk offers.
+  SDK_DIR: /mnt/nanokvm/LicheeRV-Nano-Build
+  HOST_TOOLS_URL: https://sophon-file.sophon.cn/sophon-prod-s3/drive/23/03/07/16/host-tools.tar.gz
+
+jobs:
+  image:
+    name: Build ${{ inputs.variant }} SD image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout NanoKVM
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve version and board
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          VERSION="$INPUT_VERSION"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(git tag --list '[0-9]*.[0-9]*.[0-9]*' --merged HEAD --sort=-v:refname | head -n1 || true)
+          fi
+          if [ -z "$VERSION" ]; then
+            VERSION="0.0.${GITHUB_RUN_NUMBER}"
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::invalid version '$VERSION', expected MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          case "$VARIANT" in
+            standard) BOARD=sg2002_licheervnano_sd ;;
+            minimal)  BOARD=sg2002_licheervnano_sd_minimal ;;
+            *) echo "::error::unknown variant '$VARIANT'"; exit 1 ;;
+          esac
+          SHORT_SHA=$(git rev-parse --short=12 HEAD)
+          {
+            echo "version=$VERSION"
+            echo "board=$BOARD"
+            echo "app_sha=$SHORT_SHA"
+            echo "artifact_name=nanokvm-image-${VARIANT}-${VERSION}-${SHORT_SHA}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building app $VERSION ($SHORT_SHA) on board $BOARD"
+
+      - name: Free up disk space
+        run: |
+          echo "Before:"
+          df -h / /mnt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/share/powershell \
+                      /usr/share/swift /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo mkdir -p /mnt/nanokvm
+          sudo chown "$(id -u):$(id -g)" /mnt/nanokvm
+          echo "After:"
+          df -h / /mnt
+
+      - name: Install SDK build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential autoconf automake autotools-dev ninja-build make help2man \
+            libncurses-dev gawk flex bison openssl libssl-dev tree wget curl cmake ccache \
+            libtool-bin bc ca-certificates cpio file git locales python3 python3-dev python3-pip \
+            python3-distutils python3-setuptools rsync unzip pkg-config squashfs-tools \
+            android-sdk-libsparse-utils jq device-tree-compiler fakeroot xz-utils zstd \
+            parted erofs-utils genext2fs mtools dosfstools e2fsprogs fuse libfuse2 \
+            slib tclsh scons parallel libconfuse-dev libssl-dev u-boot-tools
+
+      - name: Checkout SDK ${{ inputs.sdk_repo }}@${{ inputs.sdk_ref }}
+        env:
+          SDK_REPO: ${{ inputs.sdk_repo }}
+          SDK_REF: ${{ inputs.sdk_ref }}
+        run: |
+          git clone --depth=1 --branch "$SDK_REF" "https://github.com/${SDK_REPO}.git" "$SDK_DIR" \
+            || {
+              # --branch does not accept a bare commit; fall back to a fetch.
+              git init "$SDK_DIR"
+              git -C "$SDK_DIR" remote add origin "https://github.com/${SDK_REPO}.git"
+              git -C "$SDK_DIR" fetch --depth=1 origin "$SDK_REF"
+              git -C "$SDK_DIR" checkout --detach FETCH_HEAD
+            }
+          echo "sdk_sha=$(git -C "$SDK_DIR" rev-parse HEAD)" >> "$GITHUB_ENV"
+          git -C "$SDK_DIR" log -1 --oneline
+
+      - name: Verify the kernel carries the CD/DVD emulation fix
+        # This is the whole point of building an image. Refuse to spend hours
+        # on an SDK revision that still has the 2.2 GiB CD-ROM truncation.
+        run: |
+          SRC="$SDK_DIR/linux_5.10/drivers/usb/gadget/function/storage_common.c"
+          if [ ! -f "$SRC" ]; then
+            echo "::error::$SRC not found in the SDK checkout"
+            exit 1
+          fi
+          if grep -q 'using only first' "$SRC" || ! grep -q 'cd_as_dvd' "$SRC"; then
+            echo "::error::the SDK kernel still truncates CD-ROM images (missing LicheeRV-Nano-Build#102); large Windows ISOs would not boot"
+            exit 1
+          fi
+          echo "storage_common.c handles big CD images as DVD (cd_as_dvd) - OK"
+
+      - name: Install RISC-V host toolchain
+        run: |
+          wget -q -O /tmp/host-tools.tar.gz "$HOST_TOOLS_URL"
+          tar -C "$SDK_DIR" -xzf /tmp/host-tools.tar.gz
+          rm -f /tmp/host-tools.tar.gz
+          "$SDK_DIR/host-tools/gcc/riscv64-linux-musl-x86_64/bin/riscv64-unknown-linux-musl-gcc" --version | head -1
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          max-size: 4G
+          key: sdk-${{ inputs.variant }}-${{ inputs.sdk_ref }}
+
+      - name: Build system image (${{ steps.meta.outputs.board }})
+        env:
+          BOARD: ${{ steps.meta.outputs.board }}
+        run: |
+          cd "$SDK_DIR"
+          # Buildroot refuses a PATH containing spaces; the runner's is clean,
+          # but keep the same guard the SDK README recommends.
+          export PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '[[:space:]]' | paste -sd: -)"
+          # shellcheck disable=SC1091
+          source build/cvisetup.sh
+          defconfig "$BOARD"
+          build_all
+          IMG=$(find "install/soc_${BOARD}/images" -maxdepth 1 -type f -name '*.img' ! -name '*-nanokvm.img' -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')
+          if [ -z "$IMG" ]; then
+            echo "::error::build_all finished but no *.img was produced in install/soc_${BOARD}/images"
+            ls -la "install/soc_${BOARD}/images" || true
+            exit 1
+          fi
+          echo "base_image=$SDK_DIR/$IMG" >> "$GITHUB_ENV"
+          ls -lh "$IMG"
+          df -h / /mnt
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up pnpm
+        run: npm install --global pnpm@11
+
+      - name: Build frontend
+        run: make web
+
+      - name: Log in to GHCR
+        continue-on-error: true
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Pull builder image
+        env:
+          BUILDER_IMAGE: ${{ inputs.builder_image }}
+        run: |
+          ok=0
+          for attempt in 1 2 3; do
+            if docker pull "$BUILDER_IMAGE"; then ok=1; break; fi
+            echo "pull attempt $attempt failed, retrying in 15s"
+            sleep 15
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::could not pull $BUILDER_IMAGE - run the 'Builder Image' workflow in this repository and pass its ghcr.io reference as builder_image"
+            exit 1
+          fi
+
+      - name: Build riscv64 application artifacts
+        run: |
+          make release-build DOCKER_TTY= IMAGE_NAME="${{ inputs.builder_image }}"
+
+      - name: Stage application tree
+        # package.sh assembles the exact /kvmapp layout the updater installs
+        # (server binary, dl_lib, web, EDID tool, version). Reuse it as the
+        # kvmapp the SDK merge script copies into the image.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          make package VERSION="$VERSION"
+          rm -rf /mnt/nanokvm/app
+          mkdir -p /mnt/nanokvm/app
+          cp -a "build/release/nanokvm_${VERSION}" /mnt/nanokvm/app/kvmapp
+          test -x /mnt/nanokvm/app/kvmapp/server/NanoKVM-Server
+          test -x /mnt/nanokvm/app/kvmapp/kvm_system/kvm_system
+          test -f /mnt/nanokvm/app/kvmapp/server/web/index.html
+          test -f /mnt/nanokvm/app/kvmapp/system/ko/soph_mipi_rx.ko
+          test -f /mnt/nanokvm/app/kvmapp/version
+          cat /mnt/nanokvm/app/kvmapp/version
+
+      - name: Merge application into system image
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          cd "$SDK_DIR"
+          chmod +x host/fuse2fs host/mount_ext4.sh kvm/merge_nanokvm_app.sh
+          export LD_LIBRARY_PATH="$SDK_DIR/host${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export PATH="$SDK_DIR/host-tools/gcc/riscv64-linux-musl-x86_64/bin:$PATH"
+          OUT="$SDK_DIR/NanoKVM_${VARIANT}_app-${VERSION}.img"
+          ./kvm/merge_nanokvm_app.sh -a /mnt/nanokvm/app -i "$base_image" -o "$OUT" -f
+          echo "final_image=$OUT" >> "$GITHUB_ENV"
+          ls -lh "$OUT"
+
+      - name: Check the merged image for the old mass-storage driver
+        # Best effort: the kernel is usually stored uncompressed enough for the
+        # driver's log strings to be visible. The source check above is the
+        # authoritative one; this only guards against a stale prebuilt kernel.
+        run: |
+          if grep -a -q 'using only first %d blocks' "$final_image"; then
+            echo "::error::the image contains the old CD-ROM truncation code path"
+            exit 1
+          fi
+          if grep -a -q 'file too small' "$final_image"; then
+            echo "kernel strings visible; old truncation path absent - OK"
+          else
+            echo "::warning::kernel strings not visible in the image (compressed kernel); relying on the source check"
+          fi
+
+      - name: Compress and checksum
+        env:
+          ARTIFACT_NAME: ${{ steps.meta.outputs.artifact_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          VARIANT: ${{ inputs.variant }}
+          BOARD: ${{ steps.meta.outputs.board }}
+          APP_SHA: ${{ steps.meta.outputs.app_sha }}
+          SDK_REPO: ${{ inputs.sdk_repo }}
+          SDK_REF: ${{ inputs.sdk_ref }}
+          BUILDER_IMAGE: ${{ inputs.builder_image }}
+        run: |
+          mkdir -p /mnt/nanokvm/out
+          NAME=$(basename "$final_image")
+          zstd -T0 -19 --long=27 -q -o "/mnt/nanokvm/out/${NAME}.zst" "$final_image"
+          (cd /mnt/nanokvm/out && sha256sum "${NAME}.zst" > sha256.txt)
+          sha256sum "$final_image" | sed "s# .*#  ${NAME}#" >> /mnt/nanokvm/out/sha256.txt
+          {
+            echo "artifact=${ARTIFACT_NAME}"
+            echo "image=${NAME}"
+            echo "variant=${VARIANT}"
+            echo "board=${BOARD}"
+            echo "app_version=${VERSION}"
+            echo "app_sha=${APP_SHA}"
+            echo "sdk_repo=${SDK_REPO}"
+            echo "sdk_ref=${SDK_REF}"
+            echo "sdk_sha=${sdk_sha}"
+            echo "builder_image=${BUILDER_IMAGE}"
+            echo "run_url=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > /mnt/nanokvm/out/BUILD_INFO.txt
+          ls -lh /mnt/nanokvm/out
+          {
+            echo "### NanoKVM ${VARIANT} image"
+            echo
+            echo '```text'
+            cat /mnt/nanokvm/out/BUILD_INFO.txt
+            echo
+            cat /mnt/nanokvm/out/sha256.txt
+            echo '```'
+            echo
+            echo "Decompress with \`zstd -d ${NAME}.zst\`, then flash the .img to the SD card (Balena Etcher, dd, ...)."
+            echo "Flashing replaces the whole card, including /data: back up your ISOs first."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: |
+            /mnt/nanokvm/out/*.img.zst
+            /mnt/nanokvm/out/sha256.txt
+            /mnt/nanokvm/out/BUILD_INFO.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
