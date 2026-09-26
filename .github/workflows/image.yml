@@ -340,30 +340,30 @@ jobs:
             echo "::error::extracted boot.sd still contains the old CD-ROM truncation code"
             exit 1
           fi
-          cat > "$OUT/README.txt" <<'TXT'
-NanoKVM kernel update (no reflash)
+          sed 's/^            //' > "$OUT/README.txt" <<'TXT'
+            NanoKVM kernel update (no reflash)
 
-Installs the kernel with CD/DVD emulation for large ISOs (Windows Server /
-Windows 11) on a device that already runs the official image, keeping /data
-and all settings. fip.bin and rawimages/boot.sd MUST be replaced together.
+            Installs the kernel with CD/DVD emulation for large ISOs (Windows Server /
+            Windows 11) on a device that already runs the official image, keeping /data
+            and all settings. fip.bin and rawimages/boot.sd MUST be replaced together.
 
-On your PC (replace <ip>; the SSH password is the one set for root):
+            On your PC (replace <ip>; the SSH password is the one set for root):
 
-  scp fip.bin rawimages/boot.sd root@<ip>:/tmp/
+              scp fip.bin rawimages/boot.sd root@<ip>:/tmp/
 
-On the NanoKVM (ssh root@<ip>):
+            On the NanoKVM (ssh root@<ip>):
 
-  mkdir -p /boot/backup/rawimages
-  cp /boot/fip.bin /boot/backup/fip.bin
-  cp /boot/rawimages/boot.sd /boot/backup/rawimages/boot.sd
-  cp /tmp/fip.bin /boot/fip.bin
-  cp /tmp/boot.sd /boot/rawimages/boot.sd
-  sync
-  reboot
+              mkdir -p /boot/backup/rawimages
+              cp /boot/fip.bin /boot/backup/fip.bin
+              cp /boot/rawimages/boot.sd /boot/backup/rawimages/boot.sd
+              cp /tmp/fip.bin /boot/fip.bin
+              cp /tmp/boot.sd /boot/rawimages/boot.sd
+              sync
+              reboot
 
-To roll back, boot the card on a PC (partition 1 is FAT) and copy the files
-from backup/ back, or reflash the full image.
-TXT
+            To roll back, boot the card on a PC (partition 1 is FAT) and copy the files
+            from backup/ back, or reflash the full image.
+          TXT
           (cd "$OUT" && sha256sum fip.bin rawimages/boot.sd > sha256.txt)
           (cd /mnt/nanokvm/out && tar -czf "kernel-update-${sdk_sha:0:8}.tar.gz" kernel-update && rm -rf kernel-update)
           ls -lh /mnt/nanokvm/out
