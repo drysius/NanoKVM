@@ -19,6 +19,17 @@ name: NanoKVM Image
 # anywhere else; flashing it is a manual step.
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/image.yml
+      - kvmapp/**
+      - scripts/**
+      - server/**
+      - support/**
+      - web/**
+      - Makefile
   workflow_dispatch:
     inputs:
       version:
@@ -62,11 +73,11 @@ env:
 
 jobs:
   image:
-    name: Build ${{ inputs.variant }} SD image
+    name: Build ${{ inputs.variant || 'standard' }} SD image
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     permissions:
-      contents: read
+      contents: write
       packages: read
 
     steps:
@@ -80,7 +91,7 @@ jobs:
         id: meta
         env:
           INPUT_VERSION: ${{ inputs.version }}
-          VARIANT: ${{ inputs.variant }}
+          VARIANT: ${{ inputs.variant || 'standard' }}
         run: |
           VERSION="$INPUT_VERSION"
           if [ -z "$VERSION" ]; then
@@ -132,10 +143,10 @@ jobs:
             parted erofs-utils genext2fs mtools dosfstools e2fsprogs fuse libfuse2 \
             slib tclsh scons parallel libconfuse-dev libssl-dev u-boot-tools
 
-      - name: Checkout SDK ${{ inputs.sdk_repo }}@${{ inputs.sdk_ref }}
+      - name: Checkout SDK ${{ inputs.sdk_repo || 'sipeed/LicheeRV-Nano-Build' }}@${{ inputs.sdk_ref || 'NanoKVM' }}
         env:
-          SDK_REPO: ${{ inputs.sdk_repo }}
-          SDK_REF: ${{ inputs.sdk_ref }}
+          SDK_REPO: ${{ inputs.sdk_repo || 'sipeed/LicheeRV-Nano-Build' }}
+          SDK_REF: ${{ inputs.sdk_ref || 'NanoKVM' }}
         run: |
           git clone --depth=1 --branch "$SDK_REF" "https://github.com/${SDK_REPO}.git" "$SDK_DIR" \
             || {
@@ -174,7 +185,7 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           max-size: 4G
-          key: sdk-${{ inputs.variant }}-${{ inputs.sdk_ref }}
+          key: sdk-${{ inputs.variant || 'standard' }}-${{ inputs.sdk_ref || 'NanoKVM' }}
 
       - name: Build system image (${{ steps.meta.outputs.board }})
         env:
@@ -218,7 +229,7 @@ jobs:
 
       - name: Pull builder image
         env:
-          BUILDER_IMAGE: ${{ inputs.builder_image }}
+          BUILDER_IMAGE: ${{ inputs.builder_image || 'ghcr.io/sipeed/nanokvm-builder:latest' }}
         run: |
           ok=0
           for attempt in 1 2 3; do
@@ -233,7 +244,7 @@ jobs:
 
       - name: Build riscv64 application artifacts
         run: |
-          make release-build DOCKER_TTY= IMAGE_NAME="${{ inputs.builder_image }}"
+          make release-build DOCKER_TTY= IMAGE_NAME="${{ inputs.builder_image || 'ghcr.io/sipeed/nanokvm-builder:latest' }}"
 
       - name: Stage application tree
         # package.sh assembles the exact /kvmapp layout the updater installs
@@ -256,7 +267,7 @@ jobs:
       - name: Merge application into system image
         env:
           VERSION: ${{ steps.meta.outputs.version }}
-          VARIANT: ${{ inputs.variant }}
+          VARIANT: ${{ inputs.variant || 'standard' }}
         run: |
           cd "$SDK_DIR"
           chmod +x host/fuse2fs host/mount_ext4.sh kvm/merge_nanokvm_app.sh
@@ -286,12 +297,12 @@ jobs:
         env:
           ARTIFACT_NAME: ${{ steps.meta.outputs.artifact_name }}
           VERSION: ${{ steps.meta.outputs.version }}
-          VARIANT: ${{ inputs.variant }}
+          VARIANT: ${{ inputs.variant || 'standard' }}
           BOARD: ${{ steps.meta.outputs.board }}
           APP_SHA: ${{ steps.meta.outputs.app_sha }}
-          SDK_REPO: ${{ inputs.sdk_repo }}
-          SDK_REF: ${{ inputs.sdk_ref }}
-          BUILDER_IMAGE: ${{ inputs.builder_image }}
+          SDK_REPO: ${{ inputs.sdk_repo || 'sipeed/LicheeRV-Nano-Build' }}
+          SDK_REF: ${{ inputs.sdk_ref || 'NanoKVM' }}
+          BUILDER_IMAGE: ${{ inputs.builder_image || 'ghcr.io/sipeed/nanokvm-builder:latest' }}
         run: |
           mkdir -p /mnt/nanokvm/out
           NAME=$(basename "$final_image")
@@ -336,3 +347,18 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
+
+      - name: Publish GitHub release with the image
+        # Artifacts need a GitHub login to download and expire; a release on
+        # this repository gives a permanent, direct download link.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: image-${{ steps.meta.outputs.version }}-${{ inputs.variant || 'standard' }}-run${{ github.run_number }}
+          name: NanoKVM image ${{ steps.meta.outputs.version }} (${{ inputs.variant || 'standard' }}, run ${{ github.run_number }})
+          target_commitish: ${{ github.sha }}
+          body_path: /mnt/nanokvm/out/BUILD_INFO.txt
+          files: |
+            /mnt/nanokvm/out/*.img.zst
+            /mnt/nanokvm/out/sha256.txt
+            /mnt/nanokvm/out/BUILD_INFO.txt
+          fail_on_unmatched_files: true
