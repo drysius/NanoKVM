@@ -159,6 +159,23 @@ jobs:
           echo "sdk_sha=$(git -C "$SDK_DIR" rev-parse HEAD)" >> "$GITHUB_ENV"
           git -C "$SDK_DIR" log -1 --oneline
 
+      - name: Patch SDK device trees that the upstream commit left broken
+        # sipeed/LicheeRV-Nano-Build@9ce67e89 stopped reserving framebuffer
+        # memory for the standard board and guarded its dts with
+        # CVIMMAP_FRAMEBUFFER_SIZE, but the kernel compiles every dts under
+        # build/boards/sg200x, including the minimal variant, which still
+        # references the now-absent fb_reserved/cvi_fb labels and aborts the
+        # build. Apply the same guard there. No-op once upstream fixes it.
+        run: |
+          for f in "$SDK_DIR"/build/boards/sg200x/*/dts_riscv/*.dts; do
+            [ -f "$f" ] || continue
+            if grep -q '^&fb_reserved' "$f" && ! grep -q 'CVIMMAP_FRAMEBUFFER_SIZE' "$f"; then
+              perl -0pi -e 's/(&fb_reserved \{[^}]*\};\s*&cvi_fb \{[^}]*\};)/#if (CVIMMAP_FRAMEBUFFER_SIZE > 0)\n$1\n#endif/' "$f"
+              echo "guarded framebuffer nodes in ${f#$SDK_DIR/}"
+              grep -n -B1 -A7 'CVIMMAP_FRAMEBUFFER_SIZE' "$f"
+            fi
+          done
+
       - name: Verify the kernel carries the CD/DVD emulation fix
         # This is the whole point of building an image. Refuse to spend hours
         # on an SDK revision that still has the 2.2 GiB CD-ROM truncation.
