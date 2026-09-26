@@ -318,6 +318,56 @@ jobs:
             echo "::warning::kernel strings not visible in the image (compressed kernel); relying on the source check"
           fi
 
+      - name: Extract kernel-update files from the image
+        # The kernel lives on the FAT boot partition as fip.bin (bootloader)
+        # and rawimages/boot.sd (kernel + device tree). Copying both onto a
+        # running device's /boot and rebooting installs the fixed kernel
+        # without reflashing the card, so /data and settings survive. They
+        # must be replaced together: the SDK memory map changed and fip.bin
+        # and the device tree have to agree on it.
+        run: |
+          OUT=/mnt/nanokvm/out/kernel-update
+          mkdir -p "$OUT/rawimages"
+          BOOT_OFFSET=$(partx -s -g -o START -n 1 "$final_image" | tr -d ' ')
+          BOOT_SECTORS=$(partx -s -g -o SECTORS -n 1 "$final_image" | tr -d ' ')
+          echo "boot partition: start=$BOOT_OFFSET sectors=$BOOT_SECTORS"
+          dd if="$final_image" of=/tmp/boot.vfat bs=512 skip="$BOOT_OFFSET" count="$BOOT_SECTORS" status=none
+          MTOOLS_SKIP_CHECK=1 mdir -i /tmp/boot.vfat ::
+          MTOOLS_SKIP_CHECK=1 mcopy -i /tmp/boot.vfat ::fip.bin "$OUT/fip.bin"
+          MTOOLS_SKIP_CHECK=1 mcopy -i /tmp/boot.vfat ::rawimages/boot.sd "$OUT/rawimages/boot.sd"
+          rm -f /tmp/boot.vfat
+          if grep -a -q 'using only first %d blocks' "$OUT/rawimages/boot.sd"; then
+            echo "::error::extracted boot.sd still contains the old CD-ROM truncation code"
+            exit 1
+          fi
+          cat > "$OUT/README.txt" <<'TXT'
+NanoKVM kernel update (no reflash)
+
+Installs the kernel with CD/DVD emulation for large ISOs (Windows Server /
+Windows 11) on a device that already runs the official image, keeping /data
+and all settings. fip.bin and rawimages/boot.sd MUST be replaced together.
+
+On your PC (replace <ip>; the SSH password is the one set for root):
+
+  scp fip.bin rawimages/boot.sd root@<ip>:/tmp/
+
+On the NanoKVM (ssh root@<ip>):
+
+  mkdir -p /boot/backup/rawimages
+  cp /boot/fip.bin /boot/backup/fip.bin
+  cp /boot/rawimages/boot.sd /boot/backup/rawimages/boot.sd
+  cp /tmp/fip.bin /boot/fip.bin
+  cp /tmp/boot.sd /boot/rawimages/boot.sd
+  sync
+  reboot
+
+To roll back, boot the card on a PC (partition 1 is FAT) and copy the files
+from backup/ back, or reflash the full image.
+TXT
+          (cd "$OUT" && sha256sum fip.bin rawimages/boot.sd > sha256.txt)
+          (cd /mnt/nanokvm/out && tar -czf "kernel-update-${sdk_sha:0:8}.tar.gz" kernel-update && rm -rf kernel-update)
+          ls -lh /mnt/nanokvm/out
+
       - name: Compress and checksum
         env:
           ARTIFACT_NAME: ${{ steps.meta.outputs.artifact_name }}
@@ -331,7 +381,7 @@ jobs:
         run: |
           NAME=$(basename "$final_image")
           zstd -T0 -19 --long=27 -q -o "/mnt/nanokvm/out/${NAME}.zst" "$final_image"
-          (cd /mnt/nanokvm/out && sha256sum "${NAME}.zst" nanokvm_*.tar.gz > sha256.txt)
+          (cd /mnt/nanokvm/out && sha256sum "${NAME}.zst" nanokvm_*.tar.gz kernel-update-*.tar.gz > sha256.txt)
           sha256sum "$final_image" | sed "s# .*#  ${NAME}#" >> /mnt/nanokvm/out/sha256.txt
           {
             echo "artifact=${ARTIFACT_NAME}"
@@ -360,6 +410,8 @@ jobs:
             echo "Flashing replaces the whole card, including /data: back up your ISOs first."
             echo
             echo "nanokvm_${VERSION}.tar.gz is the application-only package for the on-device updater (Settings > Update > offline). It does not include the kernel fix; flash the image first."
+            echo
+            echo "kernel-update-*.tar.gz holds fip.bin and rawimages/boot.sd: copy both to /boot on a running device and reboot to get the fixed kernel without reflashing (README inside)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload image
@@ -370,6 +422,7 @@ jobs:
             /mnt/nanokvm/out/*.img.zst
             /mnt/nanokvm/out/nanokvm_*.tar.gz
             /mnt/nanokvm/out/latest.json
+            /mnt/nanokvm/out/kernel-update-*.tar.gz
             /mnt/nanokvm/out/sha256.txt
             /mnt/nanokvm/out/BUILD_INFO.txt
           if-no-files-found: error
@@ -389,6 +442,7 @@ jobs:
             /mnt/nanokvm/out/*.img.zst
             /mnt/nanokvm/out/nanokvm_*.tar.gz
             /mnt/nanokvm/out/latest.json
+            /mnt/nanokvm/out/kernel-update-*.tar.gz
             /mnt/nanokvm/out/sha256.txt
             /mnt/nanokvm/out/BUILD_INFO.txt
           fail_on_unmatched_files: true
