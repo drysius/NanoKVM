@@ -206,7 +206,9 @@ jobs:
 
       - name: Build system image (${{ steps.meta.outputs.board }})
         env:
-          BOARD: ${{ steps.meta.outputs.board }}
+          # Not BOARD: the SDK's cvisetup.sh exports its own BOARD (the part
+          # after the chip name) and would clobber ours.
+          NANOKVM_BOARD: ${{ steps.meta.outputs.board }}
         run: |
           cd "$SDK_DIR"
           # Buildroot refuses a PATH containing spaces; the runner's is clean,
@@ -214,12 +216,12 @@ jobs:
           export PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '[[:space:]]' | paste -sd: -)"
           # shellcheck disable=SC1091
           source build/cvisetup.sh
-          defconfig "$BOARD"
+          defconfig "$NANOKVM_BOARD"
           build_all
-          IMG=$(find "install/soc_${BOARD}/images" -maxdepth 1 -type f -name '*.img' ! -name '*-nanokvm.img' -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')
+          IMG=$(find "install/soc_${NANOKVM_BOARD}/images" -maxdepth 1 -type f -name '*.img' ! -name '*-nanokvm.img' -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')
           if [ -z "$IMG" ]; then
-            echo "::error::build_all finished but no *.img was produced in install/soc_${BOARD}/images"
-            ls -la "install/soc_${BOARD}/images" || true
+            echo "::error::build_all finished but no *.img was produced in install/soc_${NANOKVM_BOARD}/images"
+            ls -la "install/soc_${NANOKVM_BOARD}/images" || true
             exit 1
           fi
           echo "base_image=$SDK_DIR/$IMG" >> "$GITHUB_ENV"
