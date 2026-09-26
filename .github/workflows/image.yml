@@ -273,6 +273,12 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           make package VERSION="$VERSION"
+          # Keep the application package next to the image: it is the same
+          # nanokvm_<version>.tar.gz that the on-device updater and the manual
+          # offline update UI consume (see package.yml). It cannot carry the
+          # kernel fix; flash the .img once, then use the tarball for updates.
+          mkdir -p /mnt/nanokvm/out
+          cp "build/release/nanokvm_${VERSION}.tar.gz" build/release/latest.json /mnt/nanokvm/out/
           rm -rf /mnt/nanokvm/app
           mkdir -p /mnt/nanokvm/app
           cp -a "build/release/nanokvm_${VERSION}" /mnt/nanokvm/app/kvmapp
@@ -323,10 +329,9 @@ jobs:
           SDK_REF: ${{ inputs.sdk_ref || 'NanoKVM' }}
           BUILDER_IMAGE: ${{ inputs.builder_image || 'ghcr.io/sipeed/nanokvm-builder:latest' }}
         run: |
-          mkdir -p /mnt/nanokvm/out
           NAME=$(basename "$final_image")
           zstd -T0 -19 --long=27 -q -o "/mnt/nanokvm/out/${NAME}.zst" "$final_image"
-          (cd /mnt/nanokvm/out && sha256sum "${NAME}.zst" > sha256.txt)
+          (cd /mnt/nanokvm/out && sha256sum "${NAME}.zst" nanokvm_*.tar.gz > sha256.txt)
           sha256sum "$final_image" | sed "s# .*#  ${NAME}#" >> /mnt/nanokvm/out/sha256.txt
           {
             echo "artifact=${ARTIFACT_NAME}"
@@ -353,6 +358,8 @@ jobs:
             echo
             echo "Decompress with \`zstd -d ${NAME}.zst\`, then flash the .img to the SD card (Balena Etcher, dd, ...)."
             echo "Flashing replaces the whole card, including /data: back up your ISOs first."
+            echo
+            echo "nanokvm_${VERSION}.tar.gz is the application-only package for the on-device updater (Settings > Update > offline). It does not include the kernel fix; flash the image first."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload image
@@ -361,6 +368,8 @@ jobs:
           name: ${{ steps.meta.outputs.artifact_name }}
           path: |
             /mnt/nanokvm/out/*.img.zst
+            /mnt/nanokvm/out/nanokvm_*.tar.gz
+            /mnt/nanokvm/out/latest.json
             /mnt/nanokvm/out/sha256.txt
             /mnt/nanokvm/out/BUILD_INFO.txt
           if-no-files-found: error
@@ -378,6 +387,8 @@ jobs:
           body_path: /mnt/nanokvm/out/BUILD_INFO.txt
           files: |
             /mnt/nanokvm/out/*.img.zst
+            /mnt/nanokvm/out/nanokvm_*.tar.gz
+            /mnt/nanokvm/out/latest.json
             /mnt/nanokvm/out/sha256.txt
             /mnt/nanokvm/out/BUILD_INFO.txt
           fail_on_unmatched_files: true
